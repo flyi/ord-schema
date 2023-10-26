@@ -24,8 +24,8 @@ The `examples/` directory contains examples of dataset creation and use. To run 
 $ pip install "ord-schema[examples]"
 ```
 
-Click here to run the examples with
-Binder: [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/open-reaction-database/ord-schema/HEAD?filepath=examples)
+Click here to run the examples with Binder:
+[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/open-reaction-database/ord-schema/HEAD?labpath=examples)
 
 ## Development
 
@@ -37,5 +37,23 @@ $ cd ord-schema
 $ pip install -e .
 ```
 
-If you make changes to the protocol buffer definitions, [install](https://grpc.io/docs/protoc-installation/) `protoc` 
+If you make changes to the protocol buffer definitions, [install](https://grpc.io/docs/protoc-installation/) `protoc`
 and run `./compile_proto_wrappers.sh` to rebuild the wrappers.
+
+## Conventions
+
+### 1. convention: compound stoichiometry
+
+##### Created: 2023.07.04
+
+##### Last updated: 2023.07.04
+
+##### Description: 
+1. The preferred field for compound stoichiometry is the map `Compound.features` or `ProductCompound.features`.
+2. The key should be "stoichiometric_coefficient" or "stoichiometric_ratio".
+3. The value should be a `Data` message with its `float_value` representing the compound's stoichiometric 
+coefficient or ratio.
+
+##### Related links: 
+[#683](https://github.com/open-reaction-database/ord-schema/issues/683) 
+[#684](https://github.com/open-reaction-database/ord-schema/pull/684)

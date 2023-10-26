@@ -20,7 +20,7 @@ Usage:
 
 Options:
     --pattern=<str>         Pattern for dataset filenames
-    --overwrite             Overwrite existing datasets
+    --overwrite             Update changed datasets
     --url=<str>             Postgres connection string
     --database=<str>        Database [default: orm]
     --username=<str>        Database username [default: postgres]
@@ -33,16 +33,25 @@ import os
 import time
 from functools import partial
 from glob import glob
+from hashlib import md5
 from concurrent.futures import ProcessPoolExecutor
 
 from docopt import docopt
+from rdkit import RDLogger
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from ord_schema.logging import get_logger
 from ord_schema.message_helpers import load_message
-from ord_schema.orm.database import add_dataset, add_rdkit, delete_dataset, get_connection_string
-from ord_schema.proto.dataset_pb2 import Dataset
+from ord_schema.orm.database import (
+    add_dataset,
+    delete_dataset,
+    get_connection_string,
+    get_dataset_md5,
+    update_rdkit_ids,
+    update_rdkit_tables,
+)
+from ord_schema.proto import dataset_pb2
 
 logger = get_logger(__name__)
 
@@ -53,23 +62,40 @@ def _add_dataset(filename: str, url: str, overwrite: bool) -> None:
     Args:
         filename: Dataset filename.
         url: Database connection string.
-        overwrite: If True, overwrite an existing dataset.
+        overwrite: If True, update the dataset if the MD5 hash has changed.
+
+    Raises:
+        ValueError: If the dataset already exists in the database and `overwrite` is not set.
     """
     logger.info(f"Loading {filename}")
     start = time.time()
-    dataset = load_message(filename, Dataset)
-    logger.info(f"load_message() took {time.time() - start}s")
+    dataset = load_message(filename, dataset_pb2.Dataset)
+    logger.info(f"load_message() took {time.time() - start:g}s")
     engine = create_engine(url, future=True)
     with Session(engine) as session:
-        if overwrite:
-            delete_dataset(dataset.dataset_id, session)
+        dataset_md5 = get_dataset_md5(dataset.dataset_id, session)
+        if dataset_md5 is not None:
+            this_md5 = md5(dataset.SerializeToString(deterministic=True)).hexdigest()
+            if this_md5 != dataset_md5:
+                if not overwrite:
+                    raise ValueError(f"`overwrite` is required when a dataset already exists: {dataset.dataset_id}")
+                logger.info(f"existing dataset {dataset.dataset_id} changed; updating")
+                delete_dataset(dataset.dataset_id, session)
+            else:
+                logger.info(f"existing dataset {dataset.dataset_id} unchanged; skipping")
+                return
         add_dataset(dataset, session)
+        session.flush()
+        update_rdkit_tables(dataset.dataset_id, session=session)
+        session.flush()
+        update_rdkit_ids(dataset.dataset_id, session=session)
         start = time.time()
         session.commit()
-        logger.info(f"session.commit() took {time.time() - start}s")
+        logger.info(f"session.commit() took {time.time() - start:g}s")
 
 
 def main(**kwargs):
+    RDLogger.DisableLog("rdApp.*")
     if kwargs.get("--url"):
         url = kwargs["--url"]
     else:
@@ -85,12 +111,6 @@ def main(**kwargs):
     with ProcessPoolExecutor(max_workers=int(kwargs["--n_jobs"])) as executor:
         for _ in executor.map(function, filenames):
             pass  # Must iterate over results to raise exceptions.
-    engine = create_engine(url, future=True)
-    with Session(engine) as session:
-        add_rdkit(session)
-        start = time.time()
-        session.commit()
-        logger.info(f"session.commit() took {time.time() - start}s")
 
 
 if __name__ == "__main__":

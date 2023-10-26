@@ -18,13 +18,14 @@ import functools
 import gzip
 import os
 import re
+import urllib.parse
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Optional, Type, TypeVar, Union
 
 import pandas as pd
 import requests
-from google import protobuf
+from google import protobuf  # pytype: disable=import-error
 from google.protobuf import json_format
 from google.protobuf import text_format  # pytype: disable=import-error
 from rdkit import Chem
@@ -42,6 +43,7 @@ _COMPOUND_IDENTIFIER_LOADERS = {
     reaction_pb2.CompoundIdentifier.MOLBLOCK: Chem.MolFromMolBlock,
 }
 MessageType = TypeVar("MessageType")  # Generic for setting return types; pylint: disable=invalid-name.
+ORD_DATA_URL = "https://github.com/Open-Reaction-Database/ord-data/raw/main/"
 
 # pylint: disable=too-many-arguments
 # pylint: disable=too-many-branches
@@ -250,13 +252,16 @@ def find_submessages(message: ord_schema.Message, submessage_type: Type[MessageT
     return submessages
 
 
-def smiles_from_compound(compound: Union[reaction_pb2.Compound, reaction_pb2.ProductCompound]) -> str:
+def smiles_from_compound(
+    compound: Union[reaction_pb2.Compound, reaction_pb2.ProductCompound], canonical: bool = True
+) -> str:
     """Fetches or generates a SMILES identifier for a compound.
 
     If a SMILES identifier already exists, it is simply returned.
 
     Args:
         compound: reaction_pb2.Compound or reaction_pb2.ProductCompound message.
+        validate: If True, returns a canonicalized SMILES.
 
     Returns:
         Text SMILES.
@@ -264,7 +269,13 @@ def smiles_from_compound(compound: Union[reaction_pb2.Compound, reaction_pb2.Pro
     Raises:
         ValueError: if no structural identifiers are defined.
     """
-    return get_compound_smiles(compound) or Chem.MolToSmiles(mol_from_compound(compound))
+    smiles = get_compound_smiles(compound) or Chem.MolToSmiles(mol_from_compound(compound))
+    if canonical:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            raise ValueError(f"Cannot parse SMILES: {smiles}")
+        smiles = Chem.MolToSmiles(mol)
+    return smiles
 
 
 def molblock_from_compound(compound: reaction_pb2.Compound) -> str:
@@ -342,7 +353,8 @@ def get_reaction_smiles(
     message: reaction_pb2.Reaction,
     generate_if_missing: bool = False,
     allow_incomplete: bool = True,
-    validate: bool = True,
+    validate: bool = False,
+    canonical: bool = True,
 ) -> Optional[str]:
     """Fetches or generates a reaction SMILES.
 
@@ -355,6 +367,7 @@ def get_reaction_smiles(
             have a structural identifier).
         validate: Boolean whether to validate the reaction SMILES with rdkit.
             Only used if allow_incomplete is False.
+        canonical: Boolean whether to return a canonicalized reaction SMILES.
 
     Returns:
         Text reaction SMILES, or None.
@@ -371,6 +384,7 @@ def get_reaction_smiles(
             return identifier.value
     if not generate_if_missing:
         return None
+
     reactants, agents, products = set(), set(), set()
     roles = reaction_pb2.ReactionRole
     for key in sorted(message.inputs):
@@ -383,10 +397,11 @@ def get_reaction_smiles(
                 raise error
             if compound.reaction_role in [roles.REAGENT, roles.SOLVENT, roles.CATALYST]:
                 agents.add(smiles)
-            elif compound.reaction_role == roles.INTERNAL_STANDARD:
-                continue
-            else:
+            elif compound.reaction_role == roles.REACTANT:
                 reactants.add(smiles)
+            else:
+                continue
+
     for outcome in message.outcomes:
         for product in outcome.products:
             try:
@@ -414,19 +429,22 @@ def get_reaction_smiles(
         ".".join(sorted(products)),
     ]
     reaction_smiles = ">".join(components)
-    if validate and not allow_incomplete:
-        reaction_smiles = validate_reaction_smiles(reaction_smiles)
+    if validate:
+        if allow_incomplete:
+            raise ValueError("validate is mutually exclusive with allow_incomplete")
+        validate_reaction_smiles(reaction_smiles)
+    if canonical:
+        reaction_smiles = rdChemReactions.ReactionToSmiles(
+            rdChemReactions.ReactionFromSmarts(reaction_smiles, useSmiles=True)
+        )
     return reaction_smiles
 
 
-def validate_reaction_smiles(reaction_smiles: str) -> str:
+def validate_reaction_smiles(reaction_smiles: str) -> None:
     """Validates reaction SMILES.
 
     Args:
         reaction_smiles: Text reaction SMILES.
-
-    Returns:
-        Updated reaction SMILES.
 
     Raises:
         ValueError: If the reaction contains errors.
@@ -441,7 +459,6 @@ def validate_reaction_smiles(reaction_smiles: str) -> str:
             raise ValueError("reaction SMILES contains errors")
     except (RuntimeError, ValueError) as error:
         raise ValueError(f"bad reaction SMILES ({str(error)}): {reaction_smiles}") from error
-    return rdChemReactions.ReactionToSmiles(reaction)
 
 
 def reaction_from_smiles(reaction_smiles):
@@ -719,11 +736,19 @@ def fetch_dataset(dataset_id: str, timeout: float = 10.0) -> dataset_pb2.Dataset
 
     Returns:
         Dataset message.
+
+    Raises:
+        RuntimeError: If the request fails.
+        ValueError: If the dataset ID is invalid.
     """
-    url = os.path.join(
-        "https://github.com/open-reaction-database/ord-data/raw/main", id_filename(f"{dataset_id}.pb.gz")
-    )
+    from ord_schema import validations  # Avoid circular import; pylint: disable=import-outside-toplevel.
+
+    if not validations.is_valid_dataset_id(dataset_id):
+        raise ValueError(f"Invalid dataset ID: {dataset_id}")
+    url = urllib.parse.urljoin(ORD_DATA_URL, id_filename(f"{dataset_id}.pb.gz"))
     response = requests.get(url, timeout=timeout)
+    if response.status_code != 200:
+        raise RuntimeError(f"Request {url} failed with status {response.status_code}")
     return dataset_pb2.Dataset.FromString(gzip.decompress(response.content))
 
 

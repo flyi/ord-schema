@@ -27,7 +27,7 @@ import os
 from distutils.util import strtobool  # pylint: disable=deprecated-module
 from enum import Enum
 
-from sqlalchemy import Column, Index, Integer, ForeignKey, Text, func
+from sqlalchemy import Column, Index, Integer, Text, func
 from sqlalchemy.types import UserDefinedType
 
 from ord_schema.orm import Base
@@ -50,7 +50,7 @@ class _RDKitMol(UserDefinedType):
     def get_col_spec(self, **kwargs):
         """Returns the column type."""
         del kwargs  # Unused.
-        return "rdkit.mol" if rdkit_cartridge() else "bytea"
+        return "mol" if rdkit_cartridge() else "bytea"
 
 
 class _RDKitReaction(UserDefinedType):
@@ -65,7 +65,7 @@ class _RDKitReaction(UserDefinedType):
     def get_col_spec(self, **kwargs):
         """Returns the column type."""
         del kwargs  # Unused.
-        return "rdkit.reaction" if rdkit_cartridge() else "bytea"
+        return "reaction" if rdkit_cartridge() else "bytea"
 
 
 class _RDKitBfp(UserDefinedType):
@@ -80,13 +80,7 @@ class _RDKitBfp(UserDefinedType):
     def get_col_spec(self, **kwargs):
         """Returns the column type."""
         del kwargs  # Unused.
-        return "rdkit.bfp" if rdkit_cartridge() else "bytea"
-
-    class comparator_factory(  # pylint: disable=abstract-method,invalid-name
-        UserDefinedType.Comparator  # pytype: disable=attribute-error
-    ):
-        def __mod__(self, other):
-            return self.bool_op("operator(rdkit.%)")(other)
+        return "bfp" if rdkit_cartridge() else "bytea"
 
 
 class _RDKitSfp(UserDefinedType):
@@ -101,13 +95,7 @@ class _RDKitSfp(UserDefinedType):
     def get_col_spec(self, **kwargs):
         """Returns the column type."""
         del kwargs  # Unused.
-        return "rdkit.sfp" if rdkit_cartridge() else "bytea"
-
-    class comparator_factory(  # pylint: disable=abstract-method,invalid-name
-        UserDefinedType.Comparator  # pytype: disable=attribute-error
-    ):
-        def __mod__(self, other):
-            return self.bool_op("operator(rdkit.%)")(other)
+        return "sfp" if rdkit_cartridge() else "bytea"
 
 
 class CString(UserDefinedType):
@@ -128,8 +116,8 @@ class CString(UserDefinedType):
 class FingerprintType(Enum):
     """RDKit PostgreSQL fingerprint types."""
 
-    MORGAN_BFP = func.rdkit.morganbv_fp
-    MORGAN_SFP = func.rdkit.morgan_fp
+    MORGAN_BFP = func.morganbv_fp
+    MORGAN_SFP = func.morgan_fp
 
     def __call__(self, *args, **kwargs):
         return self.value(*args, **kwargs)
@@ -161,7 +149,7 @@ class RDKitMol(Base):
 
     __tablename__ = "mols"
     id = Column(Integer, primary_key=True)
-    smiles = Column(Text)
+    smiles = Column(Text, index=True, unique=True)
     mol = Column(_RDKitMol)
 
     __table_args__ = (
@@ -170,32 +158,9 @@ class RDKitMol(Base):
         {"schema": "rdkit"},
     )
 
-    ord_schema_context = Column(Text, nullable=False)
-    __mapper_args__ = {
-        "polymorphic_on": ord_schema_context,
-        "polymorphic_identity": "mols",
-        "with_polymorphic": "*",
-    }
-
     @classmethod
     def tanimoto(cls, other: str, fp_type: FingerprintType = FingerprintType.MORGAN_BFP):
-        return func.rdkit.tanimoto_sml(getattr(cls, fp_type.name.lower()), fp_type(other))
-
-
-class _CompoundRDKit(RDKitMol):
-    compound_id = Column(Integer, ForeignKey("compound.id", ondelete="CASCADE"))
-
-    __mapper_args__ = {
-        "polymorphic_identity": "Compound.rdkit",
-    }
-
-
-class _ProductCompoundRDKit(RDKitMol):
-    product_compound_id = Column(Integer, ForeignKey("product_compound.id", ondelete="CASCADE"))
-
-    __mapper_args__ = {
-        "polymorphic_identity": "ProductCompound.rdkit",
-    }
+        return func.tanimoto_sml(getattr(cls, fp_type.name.lower()), fp_type(other))
 
 
 class RDKitReaction(Base):
@@ -203,25 +168,10 @@ class RDKitReaction(Base):
 
     __tablename__ = "reactions"
     id = Column(Integer, primary_key=True)
-    reaction_smiles = Column(Text)
+    reaction_smiles = Column(Text, index=True, unique=True)
     reaction = Column(_RDKitReaction)
 
     __table_args__ = (
         Index("reaction_index", "reaction", postgresql_using="gist"),
         {"schema": "rdkit"},
     )
-
-    ord_schema_context = Column(Text, nullable=False)
-    __mapper_args__ = {
-        "polymorphic_on": ord_schema_context,
-        "polymorphic_identity": "reactions",
-        "with_polymorphic": "*",
-    }
-
-
-class _ReactionRDKit(RDKitReaction):
-    reaction_id = Column(Integer, ForeignKey("reaction.id", ondelete="CASCADE"))
-
-    __mapper_args__ = {
-        "polymorphic_identity": "Reaction.rdkit",
-    }

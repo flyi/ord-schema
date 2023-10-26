@@ -49,6 +49,8 @@ def setup():
 def _run_validation(message, **kwargs):
     original = type(message)()
     original.CopyFrom(message)
+    if "options" not in kwargs:
+        kwargs["options"] = validations.ValidationOptions(require_provenance=False)
     output = validations.validate_message(message, **kwargs)
     # Verify that `message` is unchanged by the validation process.
     assert original == message
@@ -163,6 +165,42 @@ def test_unmeasured_amount():
     assert len(output.warnings) == 0
 
 
+def test_texture_in_reaction_input():
+    def _make_dummy_reaction_input(component_texture_types, input_texture_type):
+        message = reaction_pb2.ReactionInput(texture=reaction_pb2.Texture(type=input_texture_type))
+        for texture_type in component_texture_types:
+            message.components.add().CopyFrom(
+                reaction_pb2.Compound(
+                    identifiers=[dict(type="SMILES", value="c1ccccc1")], texture=reaction_pb2.Texture(type=texture_type)
+                )
+            )
+        return message
+
+    # case 1: foam + gas -> crystal is unlikely
+    c_texture_types = ["FOAM", "GAS"]
+    i_texture_type = "CRYSTAL"
+    output = _run_validation(_make_dummy_reaction_input(c_texture_types, i_texture_type))
+    assert len(output.warnings) == 1
+
+    # case 2: wax + liquid -> liquid is allowed
+    c_texture_types = ["WAX", "LIQUID"]
+    i_texture_type = "LIQUID"
+    output = _run_validation(_make_dummy_reaction_input(c_texture_types, i_texture_type))
+    assert len(output.warnings) == 0
+
+    # case 3: oil + liquid -> solid is unlikely
+    c_texture_types = ["OIL", "LIQUID"]
+    i_texture_type = "SOLID"
+    output = _run_validation(_make_dummy_reaction_input(c_texture_types, i_texture_type))
+    assert len(output.warnings) == 1
+
+    # case 4: gas + liquid -> liquid is allowed
+    c_texture_types = ["GAS", "LIQUID"]
+    i_texture_type = "LIQUID"
+    output = _run_validation(_make_dummy_reaction_input(c_texture_types, i_texture_type))
+    assert len(output.warnings) == 0
+
+
 def test_crude_component():
     message = reaction_pb2.CrudeComponent()
     with pytest.raises(validations.ValidationError, match="reaction_id"):
@@ -216,6 +254,54 @@ def test_bad_reaction_smiles():
     message = reaction_pb2.Reaction()
     message.identifiers.add(value="test", type="REACTION_SMILES")
     with pytest.raises(validations.ValidationError, match="requires at least two > characters"):
+        _run_validation(message)
+
+
+@pytest.mark.parametrize(
+    "identifier_type, value",
+    (
+        ("SMILES", "CO"),
+        ("INCHI", "InChI=1S/CH4O/c1-2/h2H,1H3"),
+        (
+            "MOLBLOCK",
+            "\n     RDKit          2D\n\n  2  1  0  0  0  0  0  0  0  0999 V2000\n    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0\n    1.2990    0.7500    0.0000 O   0  0  0  0  0  0  0  0  0  0  0  0\n  1  2  1  0\nM  END\n",
+        ),
+    ),
+)
+def test_compound_identifier(identifier_type, value):
+    message = reaction_pb2.CompoundIdentifier(type=identifier_type, value=value)
+    output = _run_validation(message)
+    assert len(output.errors) == 0
+    assert len(output.warnings) == 0
+
+
+@pytest.mark.parametrize(
+    "identifier_type, value",
+    (
+        ("SMILES", "[O-]1(C)[Ir+]234([O-](C)[Ir+]1567[CH]=8CC[CH]7=[CH]6CC[CH]85)[CH]=9CC[CH]4=[CH]3CC[CH]92"),
+        ("SMILES", "CO(C)(C)(C)C"),
+        ("SMILES", "On1c(-c2ccccc2)c(-c2c(-c3ccccc3)nc3ccccc23)c2ccccc21"),
+    ),
+)
+def test_bad_compound_identifier(identifier_type, value):
+    message = reaction_pb2.CompoundIdentifier(type=identifier_type, value=value)
+    output = _run_validation(message)
+    assert len(output.errors) == 0
+    assert len(output.warnings) == 1
+    assert "could not sanitize" in output.warnings[0]
+
+
+@pytest.mark.parametrize(
+    "identifier_type, value",
+    (
+        ("SMILES", "###"),
+        ("INCHI", "###"),
+        ("MOLBLOCK", "###"),
+    ),
+)
+def test_invalid_compound_identifier(identifier_type, value):
+    message = reaction_pb2.CompoundIdentifier(type=identifier_type, value=value)
+    with pytest.raises(validations.ValidationError, match="could not validate"):
         _run_validation(message)
 
 
@@ -362,7 +448,7 @@ def test_reaction_id():
     _ = message.inputs["test"]
     message.outcomes.add()
     message.reaction_id = "ord-c0bbd41f095a44a78b6221135961d809"
-    options = validations.ValidationOptions(validate_ids=True)
+    options = validations.ValidationOptions(validate_ids=True, require_provenance=False)
     output = _run_validation(message, recurse=False, options=options)
     assert len(output.errors) == 0
     assert len(output.warnings) == 0

@@ -28,13 +28,14 @@ Notes:
       the database.
 """
 from collections import defaultdict
+from hashlib import md5
 from operator import attrgetter
 from typing import Any, Mapping, Optional, Type
 
 from google.protobuf.descriptor import Descriptor, FieldDescriptor
 from google.protobuf.message import Message
 from inflection import underscore
-from sqlalchemy import Boolean, Column, Enum, Float, Integer, ForeignKey, LargeBinary, Text
+from sqlalchemy import Boolean, Column, Enum, Float, Integer, ForeignKey, LargeBinary, String, Text
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import relationship
 
@@ -135,6 +136,7 @@ def build_mapper(  # pylint: disable=too-many-branches
         "__tablename__": underscore(message_type.DESCRIPTOR.name),
         "id": Column(Integer, primary_key=True),
         "ord_schema_context": Column(Text, nullable=False),
+        "__table_args__": ({"schema": "ord"},),
     }
     attrs["__mapper_args__"] = {
         "polymorphic_on": attrs["ord_schema_context"],
@@ -166,26 +168,32 @@ def build_mapper(  # pylint: disable=too-many-branches
     if message_type == dataset_pb2.Dataset:
         # Make dataset IDs globally unique.
         attrs["dataset_id"] = Column(Text, nullable=False, unique=True)
+        # Track the MD5 hash so we can quickly identify changes.
+        attrs["md5"] = Column(String(32), nullable=False)
     elif message_type == reaction_pb2.Reaction:
         # Make reaction IDs globally unique.
         attrs["reaction_id"] = Column(Text, nullable=False, unique=True)
         # Serialize and store the entire Reaction proto.
         attrs["proto"] = Column(LargeBinary, nullable=False)
-        attrs["rdkit"] = relationship(f"_{message_type.DESCRIPTOR.name}RDKit", uselist=False)
+        attrs["reaction_smiles"] = Column(Text, index=True)
+        attrs["rdkit_reaction_id"] = Column(Integer, ForeignKey("rdkit.reactions.id"))
+        attrs["rdkit_reaction"] = relationship("RDKitReaction")
     elif message_type in {reaction_pb2.Compound, reaction_pb2.ProductCompound}:
-        attrs["rdkit"] = relationship(f"_{message_type.DESCRIPTOR.name}RDKit", uselist=False)
+        attrs["smiles"] = Column(Text, index=True)
+        attrs["rdkit_mol_id"] = Column(Integer, ForeignKey("rdkit.mols.id"))
+        attrs["rdkit_mol"] = relationship("RDKitMol")
     elif message_type in {reaction_pb2.CompoundPreparation, reaction_pb2.CrudeComponent}:
         # Add foreign key to reaction.reaction_id.
         kwargs = {}
         if message_type == reaction_pb2.CrudeComponent:
             kwargs["nullable"] = False
-        attrs["reaction_id"] = Column(Text, ForeignKey("reaction.reaction_id", ondelete="CASCADE"), **kwargs)
+        attrs["reaction_id"] = Column(Text, ForeignKey("ord.reaction.reaction_id", ondelete="CASCADE"), **kwargs)
     logger.debug(f"Creating mapper {message_type.DESCRIPTOR.name}: {attrs}")
     mapper_class = type(message_type.DESCRIPTOR.name, (Base,), attrs)
     # Create polymorphic child classes.
     for parent_type, field_name, _ in parents[message_type]:
         foreign_table_name = underscore(parent_type.DESCRIPTOR.name)
-        foreign_key = f"{foreign_table_name}.id"
+        foreign_key = f"ord.{foreign_table_name}.id"
         child_attrs = {
             "__mapper_args__": {"polymorphic_identity": f"{parent_type.DESCRIPTOR.name}.{field_name}"},
             # Use get() to avoid column conflicts; see
@@ -243,8 +251,6 @@ def from_proto(  # pylint: disable=too-many-branches
     kwargs = {}
     if key is not None:
         kwargs["key"] = key
-    if isinstance(message, reaction_pb2.Reaction):
-        kwargs["proto"] = message.SerializeToString()
     for field, value in message.ListFields():
         if field.type == FieldDescriptor.TYPE_MESSAGE:
             field_mapper = getattr(mapper, field.name).mapper.class_
@@ -258,19 +264,21 @@ def from_proto(  # pylint: disable=too-many-branches
             kwargs[field.name] = field.enum_type.values_by_number[value].name
         else:
             kwargs[field.name] = value
-    if isinstance(message, reaction_pb2.Reaction):
-        field_mapper = getattr(mapper, "rdkit").mapper.class_
+    if isinstance(message, dataset_pb2.Dataset):
+        kwargs["md5"] = md5(message.SerializeToString(deterministic=True)).hexdigest()
+    elif isinstance(message, reaction_pb2.Reaction):
+        kwargs["proto"] = message.SerializeToString(deterministic=True)
         try:
-            reaction_smiles = message_helpers.get_reaction_smiles(message, generate_if_missing=True)
-            reaction_smiles = reaction_smiles.split()[0]  # Handle CXSMILES.
-            kwargs["rdkit"] = field_mapper(reaction_smiles=reaction_smiles)
+            reaction_smiles = message_helpers.get_reaction_smiles(
+                message, generate_if_missing=True, allow_incomplete=False, validate=True
+            )
         except ValueError:
-            pass
+            reaction_smiles = None
+        if reaction_smiles is not None:
+            kwargs["reaction_smiles"] = reaction_smiles.split()[0]  # Handle CXSMILES.
     elif isinstance(message, (reaction_pb2.Compound, reaction_pb2.ProductCompound)):
-        # Add RDKit cartridge functionality.
-        field_mapper = getattr(mapper, "rdkit").mapper.class_
         try:
-            kwargs["rdkit"] = field_mapper(smiles=message_helpers.smiles_from_compound(message))
+            kwargs["smiles"] = message_helpers.smiles_from_compound(message)
         except ValueError:
             pass
     return mapper(**kwargs)
